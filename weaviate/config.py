@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+import logging
 from typing import Optional, Tuple, Union
 
 from pydantic import BaseModel, Field
@@ -76,11 +77,18 @@ class AdditionalConfig(BaseModel):
     When specifying the proxies, be aware that supplying a URL (`str`) will populate all of the `http`, `https`, and grpc proxies.
     In order for this to be possible, you must have a proxy that is capable of handling simultaneous HTTP/1.1 and HTTP/2 traffic.
     """
+    model_config = {
+        "arbitrary_types_allowed": True,  # Required for logging.Logger support
+    }
 
     connection: ConnectionConfig = Field(default_factory=ConnectionConfig)
     proxies: Union[str, Proxies, None] = Field(default=None)
     timeout_: Union[Tuple[int, int], Timeout] = Field(default_factory=Timeout, alias="timeout")
     trust_env: bool = Field(default=False)
+    logger: Optional[logging.Logger] = Field(
+        default=None,
+        description="Optional user-provided logger object for HTTP request/response logging."
+    )
 
     @property
     def timeout(self) -> Timeout:

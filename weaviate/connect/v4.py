@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import textwrap
 import time
 from copy import copy
 from dataclasses import dataclass, field
@@ -39,7 +41,8 @@ from weaviate.auth import (
     AuthApiKey,
     AuthClientCredentials,
 )
-from weaviate.config import ConnectionConfig, Proxies, Timeout as TimeoutConfig
+from weaviate.config import AdditionalConfig, ConnectionConfig, Proxies, Timeout as TimeoutConfig
+from weaviate.logger import log_http_event
 from weaviate.connect.authentication_async import _Auth
 from weaviate.connect.base import (
     ConnectionParams,
@@ -102,7 +105,22 @@ class ConnectionV4:
         connection_config: ConnectionConfig,
         loop: asyncio.AbstractEventLoop,  # required for background token refresh
         embedded_db: Optional[EmbeddedV4] = None,
+        additional_config: Optional[AdditionalConfig] = None,
     ):
+        """Initialize the ConnectionV4 instance.
+        
+        Args:
+            connection_params: Connection parameters for the Weaviate instance
+            auth_client_secret: Authentication credentials
+            timeout_config: Timeout configuration
+            proxies: Proxy configuration
+            trust_env: Whether to trust environment variables
+            additional_headers: Additional HTTP headers
+            connection_config: Connection configuration
+            loop: Event loop for async operations
+            embedded_db: Optional embedded database instance
+            additional_config: Additional configuration including logger
+        """
         self.url = connection_params._http_url
         self.embedded_db = embedded_db
         self._api_version_path = "/v1"
@@ -119,6 +137,7 @@ class ConnectionV4:
         self._grpc_max_msg_size: Optional[int] = None
         self.__connected = False
         self.__loop = loop
+        self._additional_config = additional_config
 
         self._headers = {"content-type": "application/json"}
         self.__add_weaviate_embedding_service_header(connection_params.http.host)
@@ -232,13 +251,90 @@ class ConnectionV4:
         }
 
     def __make_async_client(self) -> AsyncClient:
-        return AsyncClient(
+        """Create an async HTTP client with proper configuration and event hooks.
+        
+        Returns:
+            AsyncClient: The configured httpx AsyncClient instance
+        """
+        event_hooks = {"response": []}
+        print("DEBUG: Initial event hooks:", event_hooks)
+        
+        # Set up logging if configured
+        logger = None
+        if hasattr(self, '_additional_config') and self._additional_config is not None:
+            logger = getattr(self._additional_config, 'logger', None)
+            print("DEBUG: Setting up HTTP client with logger:", logger)
+            print("DEBUG: Logger type:", type(logger))
+            print("DEBUG: Logger has debug method:", hasattr(logger, 'debug') if logger is not None else "Logger is None")
+
+        if logger is not None and hasattr(logger, 'debug'):
+            print("DEBUG: Configuring logger event hooks")
+            # Add logging hook
+            async def log_response(response: Response) -> None:
+                print("DEBUG: Logger hook triggered!")
+                try:
+                    # Format request info
+                    request = response.request
+                    logger.debug(f"Request: {request.method} {request.url}")
+                    logger.debug("  Headers:")
+                    for key, value in request.headers.items():
+                        key_lower = key.lower()
+                        if key_lower == "authorization":
+                            value = "[...]"
+                        elif key_lower == "cookie":
+                            value = value.split("=")[0] + "=..."
+                        logger.debug(f"    {key}: {value}")
+                    
+                    # Log request body if present
+                    if request.content:
+                        logger.debug("  Body:")
+                        try:
+                            request_body = json.loads(request.content)
+                            logger.debug(textwrap.indent(json.dumps(request_body, indent=2), "    "))
+                        except json.JSONDecodeError:
+                            logger.debug(textwrap.indent(request.content.decode(), "    "))
+                    
+                    # Format response info
+                    logger.debug(f"Response: status_code={response.status_code}")
+                    logger.debug("  Headers:")
+                    for key, value in response.headers.items():
+                        key_lower = key.lower()
+                        # Mask sensitive values in header names and values
+                        if key_lower == "set-cookie":
+                            value = value.split("=")[0] + "=..."
+                        elif key_lower == "authorization":
+                            value = "[...]"
+                        elif "authorization" in value.lower():
+                            # Mask any authorization-related values in other headers
+                            parts = value.split(",")
+                            masked_parts = []
+                            for part in parts:
+                                if "authorization" in part.lower():
+                                    masked_parts.append("Authorization=[...]")
+                                else:
+                                    masked_parts.append(part.strip())
+                            value = ", ".join(masked_parts)
+                        logger.debug(f"    {key}: {value}")
+                except Exception as e:
+                    print(f"DEBUG: Error in event hook: {e}")
+                    import traceback
+                    print("DEBUG: Traceback:", traceback.format_exc())
+            
+            event_hooks["response"].append(log_response)
+            print("DEBUG: Updated event hooks:", event_hooks)
+
+        # Create client with configured hooks
+        client = AsyncClient(
             headers=self._headers,
             mounts=self._make_mounts(),
             trust_env=self.__trust_env,
+            event_hooks=event_hooks,
         )
+        print("DEBUG: Created AsyncClient with hooks:", event_hooks)
+        return client
 
     def __make_clients(self) -> None:
+        """Create the HTTP client with proper configuration and event hooks."""
         self._client = self.__make_async_client()
 
     async def _open_connections_rest(
@@ -465,6 +561,7 @@ class ConnectionV4:
             self.embedded_db.ensure_running()
         assert self._client is not None
         try:
+            print("DEBUG: Building request:", method, url)
             req = self._client.build_request(
                 method,
                 url,
@@ -473,7 +570,17 @@ class ConnectionV4:
                 headers=self.__get_latest_headers(),
                 timeout=self.__get_timeout(method, is_gql_query),
             )
+            print("DEBUG: Sending request with client:", self._client)
             res = await self._client.send(req)
+            print("DEBUG: Got response:", res.status_code)
+
+            # Manually trigger response hooks for debugging
+            if hasattr(self._client, 'event_hooks') and 'response' in self._client.event_hooks:
+                print("DEBUG: Found event hooks, triggering manually")
+                for hook in self._client.event_hooks['response']:
+                    print("DEBUG: Executing hook:", hook)
+                    await hook(res)
+
             if res.status_code == 403:
                 raise InsufficientPermissionsError(res)
             if status_codes is not None and res.status_code not in status_codes.ok:
@@ -486,6 +593,7 @@ class ConnectionV4:
         except ReadTimeout as read_err:
             raise WeaviateTimeoutError(error_msg) from read_err
         except Exception as e:
+            print("DEBUG: Exception in __send:", str(e))
             raise e
 
     async def delete(
